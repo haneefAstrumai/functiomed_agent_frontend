@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import { Room, RoomEvent } from 'livekit-client'
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'https://ai-agent-backend-daoj.onrender.com'
-
 const STATE_TO_STEP = {
   collect_service:  0,
   collect_date:     1,
@@ -33,9 +33,6 @@ const SpeechRecognitionAPI =
     ? window.SpeechRecognition || window.webkitSpeechRecognition
     : null
 
-// Stable room ID for this browser session
-const ROOM_ID = `room-${Date.now()}`
-
 export default function VoiceAgent() {
 
   const [connectionStatus, setConnectionStatus] = useState('offline')
@@ -47,11 +44,11 @@ export default function VoiceAgent() {
   const [language, setLanguage]                 = useState('en')
   const [error, setError]                       = useState('')
 
+  const roomRef            = useRef(null)
   const recognitionRef     = useRef(null)
   const synthRef           = useRef(typeof window !== 'undefined' ? window.speechSynthesis : null)
   const messagesEndRef     = useRef(null)
   const isAgentSpeakingRef = useRef(false)
-  const isConnectedRef     = useRef(false)
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -61,6 +58,7 @@ export default function VoiceAgent() {
     return () => {
       synthRef.current?.cancel()
       recognitionRef.current?.abort()
+      roomRef.current?.disconnect()
     }
   }, [])
 
@@ -105,7 +103,7 @@ export default function VoiceAgent() {
       setIsAgentSpeaking(false)
       isAgentSpeakingRef.current = false
       setTimeout(() => {
-        if (isConnectedRef.current) startListening()
+        if (roomRef.current) startListening()
       }, 400)
     }
     utterance.onerror = (e) => {
@@ -117,40 +115,27 @@ export default function VoiceAgent() {
     synthRef.current.speak(utterance)
   }, [detectLanguage])
 
-  // ── Send text to FastAPI /agent/message instead of LiveKit DataChannel ──
   const sendToAgent = useCallback(async (text) => {
-    if (!isConnectedRef.current || !text.trim()) return
-
-    console.log('📤 Sending to FastAPI:', text)
+    if (!roomRef.current || !text.trim()) return
+    console.log('📤 Sending to agent via DataChannel:', text)
     addMessage('user', text)
     setTranscript('')
-
+    const payload = JSON.stringify({ type: 'user_message', text })
     try {
-      const res = await fetch(`${BACKEND_URL}/agent/message`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ room_id: ROOM_ID, text }),
-      })
-
-      if (!res.ok) throw new Error(`API error: ${res.status}`)
-
-      const data = await res.json()
-      console.log('✅ API response:', data)
-
-      if (data.state) setAgentState(data.state)
-      addMessage('agent', data.response)
-      speak(data.response)
-
+      await roomRef.current.localParticipant.publishData(
+        new TextEncoder().encode(payload),
+        { reliable: true }
+      )
+      console.log('✅ DataChannel message published successfully')
     } catch (err) {
-      console.error('❌ Failed to reach agent API:', err)
-      setError(`Could not reach agent: ${err.message}`)
+      console.error('❌ Failed to publish DataChannel message:', err)
     }
-  }, [addMessage, speak])
+  }, [addMessage])
 
   const startListening = useCallback(() => {
     if (isAgentSpeakingRef.current) return
     if (!isSpeechRecognitionSupported() || !SpeechRecognitionAPI) return
-    if (!isConnectedRef.current) return
+    if (!roomRef.current) return
 
     if (recognitionRef.current) {
       try { recognitionRef.current.abort() } catch (_) {}
@@ -192,7 +177,6 @@ export default function VoiceAgent() {
     try { recognition.start() } catch (err) { console.warn('Could not start recognition:', err) }
   }, [language, sendToAgent])
 
-  // ── Connect: just verify backend is reachable and get welcome message ──
   const connect = useCallback(async () => {
     if (!isSpeechRecognitionSupported()) {
       setError('Speech Recognition requires Chrome or Edge.')
@@ -200,37 +184,96 @@ export default function VoiceAgent() {
     }
     setConnectionStatus('connecting')
     setError('')
-
     try {
-      const res = await fetch(`${BACKEND_URL}/agent/message`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ room_id: ROOM_ID, text: 'hello' }),
+      // ── DEBUG 1: Token fetch ───────────────────────────────
+      const tokenUrl = `${BACKEND_URL}/livekit/token?room=room-1&username=patient-${Date.now()}`
+      console.log('🔑 [1] Fetching token from:', tokenUrl)
+
+      const res = await fetch(tokenUrl)
+      if (!res.ok) throw new Error(`Token fetch failed: ${res.status}`)
+      const { token, url } = await res.json()
+
+      // ── DEBUG 2: What URL did backend return? ──────────────
+      console.log('🔗 [2] LiveKit URL from backend:', url)
+      console.log('🎫 [2] Token (first 80 chars):', token?.slice(0, 80))
+      if (!url || url.includes('localhost') || url.includes('127.0.0.1')) {
+        console.error('🚨 [2] WARNING: URL is localhost — set LIVEKIT_URL_BROWSER on Render!')
+      }
+
+      const room = new Room({ adaptiveStream: false, dynacast: false })
+      roomRef.current = room
+
+      // ── DEBUG 3: Room connection events ───────────────────
+      room.on(RoomEvent.Connected, () => {
+        console.log('✅ [3] Room CONNECTED. Name:', room.name, '| SID:', room.sid)
+        console.log('👥 [3] Remote participants at connect:', room.remoteParticipants.size)
+        room.remoteParticipants.forEach((p, id) => {
+          console.log('   → Participant:', p.identity, '| SID:', id)
+        })
       })
 
-      if (!res.ok) throw new Error(`Backend unreachable: ${res.status}`)
+      room.on(RoomEvent.ParticipantConnected, (p) => {
+        console.log('👤 [4] Participant JOINED:', p.identity)
+      })
 
-      const data = await res.json()
-      console.log('✅ Connected. Agent welcome:', data)
+      room.on(RoomEvent.ParticipantDisconnected, (p) => {
+        console.log('👤 [4] Participant LEFT:', p.identity)
+      })
 
-      isConnectedRef.current = true
+      // ── DEBUG 4: DataReceived — the critical one ───────────
+      room.on(RoomEvent.DataReceived, (payload, participant) => {
+        console.log('📨 [5] DataReceived fired!')
+        console.log('   From:', participant?.identity ?? '(no participant info)')
+        console.log('   Bytes:', payload?.length)
+        try {
+          const raw = new TextDecoder().decode(payload)
+          console.log('   Raw text:', raw.slice(0, 300))
+          const msg = JSON.parse(raw)
+          console.log('   msg.type:', msg.type, '| msg.state:', msg.state)
+          if (msg.type === 'agent_response') {
+            if (msg.state) setAgentState(msg.state)
+            addMessage('agent', msg.text)
+            speak(msg.text)
+          } else {
+            console.warn('   ⚠️ Unexpected msg type:', msg.type)
+          }
+        } catch (e) {
+          console.error('   ❌ Parse error:', e)
+        }
+      })
+
+      room.on(RoomEvent.Disconnected, (reason) => {
+        console.log('🔌 [6] Room DISCONNECTED. Reason:', reason)
+        setConnectionStatus('offline')
+        setListening(false)
+        setIsAgentSpeaking(false)
+        synthRef.current?.cancel()
+        roomRef.current = null
+      })
+
+      // ── DEBUG 5: Attempt connection ────────────────────────
+      console.log('⏳ [7] Calling room.connect()...')
+      await room.connect(url, token)
+      console.log('✅ [7] room.connect() resolved successfully')
+      console.log('👥 [7] Participants after connect:', room.remoteParticipants.size)
+
       setConnectionStatus('online')
-
-      if (data.state) setAgentState(data.state)
-      addMessage('agent', data.response)
-      speak(data.response)
 
     } catch (err) {
       console.error('❌ Connection error:', err)
-      setError(`Could not connect to agent: ${err.message}`)
+      setError(`Could not connect: ${err.message}`)
       setConnectionStatus('offline')
+      roomRef.current = null
     }
   }, [addMessage, speak])
 
-  const disconnect = useCallback(() => {
+  const disconnect = useCallback(async () => {
     synthRef.current?.cancel()
     try { recognitionRef.current?.abort() } catch (_) {}
-    isConnectedRef.current = false
+    if (roomRef.current) {
+      await roomRef.current.disconnect()
+      roomRef.current = null
+    }
     setConnectionStatus('offline')
     setListening(false)
     setIsAgentSpeaking(false)
