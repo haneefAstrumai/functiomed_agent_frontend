@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 
 // ─── Config ───────────────────────────────────────────────────
-const BACKEND_URL = "https://ai-agent-itlm.onrender.com";
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'https://ai-agent-backend-daoj.onrender.com';
 
 // ─── Helpers ──────────────────────────────────────────────────
 const SERVICE_COLORS = {
@@ -16,7 +16,7 @@ const SERVICE_COLORS = {
 
 const getServiceStyle = (service) =>
   SERVICE_COLORS[service?.toLowerCase()] || {
-    bg: "#f1f5f9", text: "#475569", dot: "#94a3b8",
+    bg: "#f1f5f9", text: "#475569", dot: "#54575a",
   };
 
 const STATUS_STYLES = {
